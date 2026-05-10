@@ -208,37 +208,67 @@ async fn run_provider(
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) {
     let label = provider.label();
-    let mut client = match ShrederBinaryServiceClient::connect(url.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
+    const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    eprintln!("[{label}] connecting to {url}...");
+    let connect_fut = ShrederBinaryServiceClient::connect(url.clone());
+    let mut client = match tokio::time::timeout(STAGE_TIMEOUT, connect_fut).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             eprintln!("[{label}] connect failed: {e}");
             return;
         }
+        Err(_) => {
+            eprintln!("[{label}] connect timed out after {:?}", STAGE_TIMEOUT);
+            return;
+        }
     };
+    eprintln!("[{label}] connected");
+
     let request = SubscribeBinaryTransactionsRequest {
         transactions: maplit::hashmap! {
             "pools".to_owned() => filter.build()
         },
     };
     let (mut sub_tx, sub_rx) = fut_unbounded();
-    let response = match client.subscribe_binary_transactions(sub_rx).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[{label}] subscribe failed: {e}");
-            return;
-        }
-    };
+
+    // Push the request *before* awaiting the server's response. Some servers
+    // hold the bidi stream open without producing a header until they see the
+    // first client message; doing it in the original order works on Shreder
+    // but appeared to deadlock against Raiden.
     if let Err(e) = sub_tx.send(request).await {
         eprintln!("[{label}] send subscribe req failed: {e}");
         return;
     }
+    eprintln!("[{label}] subscribe request queued; awaiting server stream...");
+
+    let subscribe_fut = client.subscribe_binary_transactions(sub_rx);
+    let response = match tokio::time::timeout(STAGE_TIMEOUT, subscribe_fut).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            eprintln!("[{label}] subscribe failed: {e}");
+            return;
+        }
+        Err(_) => {
+            eprintln!(
+                "[{label}] subscribe timed out after {:?} — server accepted the connection but never opened the response stream",
+                STAGE_TIMEOUT
+            );
+            return;
+        }
+    };
     let mut stream = response.into_inner();
     eprintln!("[{label}] subscribed: {url}");
 
+    let mut got_first = false;
     loop {
         match stream.message().await {
             Ok(Some(resp)) => {
                 let arrival = Instant::now();
+                if !got_first {
+                    got_first = true;
+                    eprintln!("[{label}] first message arrived");
+                }
                 let Some(update) = resp.transaction else {
                     continue;
                 };
