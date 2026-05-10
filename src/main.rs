@@ -61,11 +61,76 @@ struct SigRec {
     shreder: Option<Instant>,
 }
 
+/// How to express the program filter on the wire. Both providers ship the
+/// same proto (3 filter fields: `account_include`, `account_exclude`,
+/// `account_required`), but `account_include` isn't implemented identically
+/// across providers — the shreder example for instance uses
+/// `account_required`. This flag lets you A/B without recompiling.
+#[derive(Clone, Copy, Debug)]
+enum FilterMode {
+    /// `account_include = [PumpFun, RaydiumAmm, RaydiumCpmm]` — what the bot uses.
+    /// Shreder honours this; Raiden may not.
+    Include,
+    /// `account_required = [PumpFun]` — matches the shreder reference example
+    /// (`SubscribeRequestFilterBinaryTransactions { account_required: [...] }`).
+    /// Single program only because `account_required` semantics are AND across
+    /// the list (every named account must appear in the tx).
+    RequiredPumpfun,
+    /// All three filter vecs empty — provider should stream everything that
+    /// matches the filter group. Useful as a "is the stream alive at all?"
+    /// probe when both targeted modes return nothing.
+    None,
+}
+
+impl FilterMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "include" => Some(Self::Include),
+            "required" | "required-pumpfun" => Some(Self::RequiredPumpfun),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    fn build(self) -> SubscribeRequestFilterBinaryTransactions {
+        match self {
+            Self::Include => SubscribeRequestFilterBinaryTransactions {
+                account_include: vec![
+                    PUMP_FUN.to_string(),
+                    RAYDIUM_LPV4.to_string(),
+                    RAYDIUM_CPMM.to_string(),
+                ],
+                account_exclude: vec![],
+                account_required: vec![],
+            },
+            Self::RequiredPumpfun => SubscribeRequestFilterBinaryTransactions {
+                account_include: vec![],
+                account_exclude: vec![],
+                account_required: vec![PUMP_FUN.to_string()],
+            },
+            Self::None => SubscribeRequestFilterBinaryTransactions {
+                account_include: vec![],
+                account_exclude: vec![],
+                account_required: vec![],
+            },
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Include => "account_include = [PumpFun, RaydiumAmm, RaydiumCpmm]",
+            Self::RequiredPumpfun => "account_required = [PumpFun]",
+            Self::None => "(empty — match-all)",
+        }
+    }
+}
+
 struct Cli {
     raiden_url: String,
     shreder_url: String,
     duration: Duration,
     grace: Duration,
+    filter: FilterMode,
 }
 
 fn parse_cli() -> Cli {
@@ -73,6 +138,7 @@ fn parse_cli() -> Cli {
     let mut shreder_url = DEFAULT_SHREDER.to_string();
     let mut duration_secs = DEFAULT_DURATION_SECS;
     let mut grace_secs = DEFAULT_GRACE_SECS;
+    let mut filter = FilterMode::Include;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -102,9 +168,18 @@ fn parse_cli() -> Cli {
                     .expect("--grace must be a number");
                 i += 2;
             }
+            "--filter" | "--filter-mode" => {
+                let v = args.get(i + 1).expect("--filter needs a value");
+                filter = FilterMode::parse(v).unwrap_or_else(|| {
+                    eprintln!("bad --filter value '{v}' (use: include | required | none)");
+                    std::process::exit(2);
+                });
+                i += 2;
+            }
             "--help" | "-h" => {
                 println!(
                     "usage: shred-bench [--duration SECS] [--grace SECS] \
+                     [--filter include|required|none] \
                      [--raiden URL] [--shreder URL]"
                 );
                 std::process::exit(0);
@@ -120,6 +195,7 @@ fn parse_cli() -> Cli {
         shreder_url,
         duration: Duration::from_secs(duration_secs),
         grace: Duration::from_secs(grace_secs),
+        filter,
     }
 }
 
@@ -128,6 +204,7 @@ fn parse_cli() -> Cli {
 async fn run_provider(
     provider: Provider,
     url: String,
+    filter: FilterMode,
     tx: mpsc::UnboundedSender<StreamEvent>,
 ) {
     let label = provider.label();
@@ -140,15 +217,7 @@ async fn run_provider(
     };
     let request = SubscribeBinaryTransactionsRequest {
         transactions: maplit::hashmap! {
-            "pools".to_owned() => SubscribeRequestFilterBinaryTransactions {
-                account_include: vec![
-                    PUMP_FUN.to_string(),
-                    RAYDIUM_LPV4.to_string(),
-                    RAYDIUM_CPMM.to_string(),
-                ],
-                account_exclude: vec![],
-                account_required: vec![],
-            }
+            "pools".to_owned() => filter.build()
         },
     };
     let (mut sub_tx, sub_rx) = fut_unbounded();
@@ -425,7 +494,7 @@ async fn main() {
     println!("  raiden  : {}", cli.raiden_url);
     println!("  shreder : {}", cli.shreder_url);
     println!("  duration: {:?}  grace: {:?}", cli.duration, cli.grace);
-    println!("  filter  : account_include = [PumpFun pAMM, Raydium AMM v4, Raydium CPMM]");
+    println!("  filter  : {}", cli.filter.label());
     println!();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<StreamEvent>();
@@ -433,11 +502,13 @@ async fn main() {
     let raiden_handle = tokio::spawn(run_provider(
         Provider::Raiden,
         cli.raiden_url.clone(),
+        cli.filter,
         tx.clone(),
     ));
     let shreder_handle = tokio::spawn(run_provider(
         Provider::Shreder,
         cli.shreder_url.clone(),
+        cli.filter,
         tx.clone(),
     ));
     drop(tx); // aggregator owns the receiving end; drops happen via task abort
