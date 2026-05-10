@@ -24,9 +24,15 @@ use shreder_binary::{
 };
 use tokio::sync::mpsc;
 
-const PUMP_FUN: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+// Bot's shred-path subscription set (`bot::spawn_shred_stream` in client.rs):
+// 3 direct AMM programs + 4 aggregator outer-programs the dispatchers handle.
+const PUMP_FUN: &str     = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
 const RAYDIUM_LPV4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const RAYDIUM_CPMM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
+const JUPITER: &str      = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const OKX: &str          = "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u";
+const DFLOW: &str        = "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH";
+const AXIOM: &str        = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9";
 
 const DEFAULT_RAIDEN: &str = "http://fra.pulse.raiden.wtf:16000";
 const DEFAULT_SHREDER: &str = "http://fra.binary.shreder.xyz:9991";
@@ -68,8 +74,9 @@ struct SigRec {
 /// `account_required`. This flag lets you A/B without recompiling.
 #[derive(Clone, Copy, Debug)]
 enum FilterMode {
-    /// `account_include = [PumpFun, RaydiumAmm, RaydiumCpmm]` — what the bot uses.
-    /// Shreder honours this; Raiden may not.
+    /// `account_include = [PumpFun, RaydiumAmm, RaydiumCpmm, Jupiter, OKX,
+    /// DFlow, Axiom]` — exactly mirrors `bot::spawn_shred_stream` in
+    /// supra-stop-loss/client.rs.
     Include,
     /// `account_required = [PumpFun]` — matches the shreder reference example
     /// (`SubscribeRequestFilterBinaryTransactions { account_required: [...] }`).
@@ -96,9 +103,17 @@ impl FilterMode {
         match self {
             Self::Include => SubscribeRequestFilterBinaryTransactions {
                 account_include: vec![
+                    // Direct AMM dispatch targets.
                     PUMP_FUN.to_string(),
                     RAYDIUM_LPV4.to_string(),
                     RAYDIUM_CPMM.to_string(),
+                    // Aggregator outer-program ids — Jupiter / OKX / DFlow /
+                    // Axiom routes show up here even when the underlying AMM
+                    // tx wouldn't trigger the AMM-only filter.
+                    JUPITER.to_string(),
+                    OKX.to_string(),
+                    DFLOW.to_string(),
+                    AXIOM.to_string(),
                 ],
                 account_exclude: vec![],
                 account_required: vec![],
@@ -118,7 +133,9 @@ impl FilterMode {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Include => "account_include = [PumpFun, RaydiumAmm, RaydiumCpmm]",
+            Self::Include => {
+                "account_include = [PumpFun pAMM, Raydium AMM v4, Raydium CPMM, Jupiter, OKX, DFlow, Axiom]"
+            }
             Self::RequiredPumpfun => "account_required = [PumpFun]",
             Self::None => "(empty — match-all)",
         }
