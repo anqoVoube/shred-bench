@@ -15,7 +15,7 @@ mod shreder_binary {
 }
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::{channel::mpsc::unbounded as fut_unbounded, sink::SinkExt};
 use shreder_binary::{
@@ -58,13 +58,39 @@ impl Provider {
 struct StreamEvent {
     provider: Provider,
     sig: [u8; 64],
+    /// Monotonic clock at message receipt — used for the wall-clock race
+    /// (cross-provider per-sig deltas).
     arrival: Instant,
+    /// Wall-clock time at message receipt — used together with `created_at`
+    /// to compute one-way latency `wall_arrival - created_at`.
+    wall_arrival: SystemTime,
+    /// Provider-stamped send time from the response envelope. `None` if
+    /// the provider didn't populate `SubscribeBinaryTransactionsResponse.
+    /// created_at` (shouldn't happen in practice but be defensive).
+    created_at: Option<SystemTime>,
 }
 
 #[derive(Default)]
 struct SigRec {
     raiden: Option<Instant>,
     shreder: Option<Instant>,
+    raiden_created_at: Option<SystemTime>,
+    shreder_created_at: Option<SystemTime>,
+}
+
+fn ts_to_system_time(ts: &prost_types::Timestamp) -> SystemTime {
+    let secs = ts.seconds.max(0) as u64;
+    let nanos = ts.nanos.max(0) as u32;
+    UNIX_EPOCH + Duration::new(secs, nanos)
+}
+
+/// Signed `a - b` in microseconds. Negative if `b > a`. Saturates at
+/// `i64::MAX` / `i64::MIN` if a duration somehow exceeds 290k years.
+fn signed_micros_diff(a: SystemTime, b: SystemTime) -> i64 {
+    match a.duration_since(b) {
+        Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_micros()).unwrap_or(i64::MAX),
+    }
 }
 
 /// How to express the program filter on the wire. Both providers ship the
@@ -282,10 +308,12 @@ async fn run_provider(
         match stream.message().await {
             Ok(Some(resp)) => {
                 let arrival = Instant::now();
+                let wall_arrival = SystemTime::now();
                 if !got_first {
                     got_first = true;
                     eprintln!("[{label}] first message arrived");
                 }
+                let created_at = resp.created_at.as_ref().map(ts_to_system_time);
                 let Some(update) = resp.transaction else {
                     continue;
                 };
@@ -305,6 +333,8 @@ async fn run_provider(
                         provider,
                         sig,
                         arrival,
+                        wall_arrival,
+                        created_at,
                     })
                     .is_err()
                 {
@@ -328,12 +358,25 @@ struct Agg {
     sigs: HashMap<[u8; 64], SigRec>,
     raiden_msgs: u64,
     shreder_msgs: u64,
-    /// All race deltas observed so far, in microseconds, signed:
-    /// negative = shreder arrived first, positive = raiden arrived first.
+    // -- wall-clock race (monotonic Instant deltas) --
+    /// Per-sig race deltas in microseconds (raiden_arrival − shreder_arrival).
+    /// Negative = shreder first, positive = raiden first.
     deltas_us: Vec<i64>,
     raiden_first: u64,
     shreder_first: u64,
     ties: u64,
+    // -- one-way wire latency: our_arrival − provider.created_at --
+    raiden_one_way_us: Vec<i64>,
+    shreder_one_way_us: Vec<i64>,
+    // -- provider-stamp race: raiden.created_at − shreder.created_at --
+    /// Per-sig provider-internal race deltas in microseconds. Subject to
+    /// host-clock skew between Raiden's and Shreder's servers — a constant
+    /// offset across all entries is the skew, variance is real processing
+    /// timing differences.
+    created_at_deltas_us: Vec<i64>,
+    created_at_raiden_first: u64,
+    created_at_shreder_first: u64,
+    created_at_ties: u64,
 }
 
 impl Agg {
@@ -346,6 +389,12 @@ impl Agg {
             raiden_first: 0,
             shreder_first: 0,
             ties: 0,
+            raiden_one_way_us: Vec::new(),
+            shreder_one_way_us: Vec::new(),
+            created_at_deltas_us: Vec::new(),
+            created_at_raiden_first: 0,
+            created_at_shreder_first: 0,
+            created_at_ties: 0,
         }
     }
 
@@ -354,23 +403,36 @@ impl Agg {
             Provider::Raiden => self.raiden_msgs += 1,
             Provider::Shreder => self.shreder_msgs += 1,
         }
+
+        // One-way latency: how long after the provider stamped the message
+        // did we see it? Sample only when the provider populated created_at.
+        if let Some(stamp) = ev.created_at {
+            let one_way = signed_micros_diff(ev.wall_arrival, stamp);
+            match ev.provider {
+                Provider::Raiden => self.raiden_one_way_us.push(one_way),
+                Provider::Shreder => self.shreder_one_way_us.push(one_way),
+            }
+        }
+
         let rec = self.sigs.entry(ev.sig).or_default();
         match ev.provider {
             Provider::Raiden => {
                 if rec.raiden.is_none() {
                     rec.raiden = Some(ev.arrival);
+                    rec.raiden_created_at = ev.created_at;
                 }
             }
             Provider::Shreder => {
                 if rec.shreder.is_none() {
                     rec.shreder = Some(ev.arrival);
+                    rec.shreder_created_at = ev.created_at;
                 }
             }
         }
-        // If both arrived now, record the race delta (only on the second arrival,
-        // so each shared sig contributes exactly one delta).
+
+        // Wall-clock race close: only on the second arrival, so each shared
+        // sig contributes exactly one delta.
         if let (Some(r), Some(s)) = (rec.raiden, rec.shreder) {
-            // Avoid double-counting: only fold in when this very event closed the pair.
             let just_closed = match ev.provider {
                 Provider::Raiden => rec.shreder.is_some() && rec.raiden == Some(ev.arrival),
                 Provider::Shreder => rec.raiden.is_some() && rec.shreder == Some(ev.arrival),
@@ -385,6 +447,19 @@ impl Agg {
                     self.raiden_first += 1;
                 } else {
                     self.ties += 1;
+                }
+                // Provider-stamp race close (only if both providers
+                // populated created_at on their respective messages).
+                if let (Some(rc), Some(sc)) = (rec.raiden_created_at, rec.shreder_created_at) {
+                    let cdelta_us = signed_micros_diff(rc, sc);
+                    self.created_at_deltas_us.push(cdelta_us);
+                    if cdelta_us < 0 {
+                        self.created_at_shreder_first += 1;
+                    } else if cdelta_us > 0 {
+                        self.created_at_raiden_first += 1;
+                    } else {
+                        self.created_at_ties += 1;
+                    }
                 }
             }
         }
@@ -430,17 +505,56 @@ fn fmt_us(us: i64) -> String {
     }
 }
 
+fn running_median(v: &[i64]) -> Option<i64> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    Some(s[s.len() / 2])
+}
+
+/// Print min / p1 / p5 / p25 / p50 / p75 / p95 / p99 / max / mean for a
+/// pre-sorted slice. No-op (with a one-line note) if empty.
+fn print_distribution(label: &str, sorted: &[i64]) {
+    if sorted.is_empty() {
+        println!("  {label}: (no samples)");
+        return;
+    }
+    let n = sorted.len() as i64;
+    let mean: i64 = sorted.iter().sum::<i64>() / n.max(1);
+    println!("  {label}");
+    println!("    n   : {}", sorted.len());
+    println!("    min : {}", fmt_us(*sorted.first().unwrap()));
+    println!("    p1  : {}", fmt_us(percentile(sorted, 1.0).unwrap()));
+    println!("    p5  : {}", fmt_us(percentile(sorted, 5.0).unwrap()));
+    println!("    p25 : {}", fmt_us(percentile(sorted, 25.0).unwrap()));
+    println!("    p50 : {}", fmt_us(percentile(sorted, 50.0).unwrap()));
+    println!("    p75 : {}", fmt_us(percentile(sorted, 75.0).unwrap()));
+    println!("    p95 : {}", fmt_us(percentile(sorted, 95.0).unwrap()));
+    println!("    p99 : {}", fmt_us(percentile(sorted, 99.0).unwrap()));
+    println!("    max : {}", fmt_us(*sorted.last().unwrap()));
+    println!("    mean: {}", fmt_us(mean));
+}
+
 fn print_rolling(agg: &Agg, elapsed: Duration) {
     let (both, r_only, s_only) = agg.coverage();
     let total = both + r_only + s_only;
     let secs = elapsed.as_secs_f64().max(0.001);
+    let r_one_way = running_median(&agg.raiden_one_way_us)
+        .map(fmt_us)
+        .unwrap_or_else(|| "    n/a".to_string());
+    let s_one_way = running_median(&agg.shreder_one_way_us)
+        .map(fmt_us)
+        .unwrap_or_else(|| "    n/a".to_string());
     println!(
-        "[{:>4.0}s] msgs raiden={:>6} ({:>6.1}/s) shreder={:>6} ({:>6.1}/s) | sigs total={:>5} both={:>5} r_only={:>4} s_only={:>4} | races r_first={:>4} s_first={:>4} ties={}",
+        "[{:>4.0}s] msgs r={:>6} ({:>6.1}/s) s={:>6} ({:>6.1}/s) | sigs total={:>5} both={:>5} r_only={:>4} s_only={:>4} | races r_first={:>5} s_first={:>5} ties={} | one_way r_p50={} s_p50={}",
         elapsed.as_secs_f64(),
         agg.raiden_msgs, agg.raiden_msgs as f64 / secs,
         agg.shreder_msgs, agg.shreder_msgs as f64 / secs,
         total, both, r_only, s_only,
         agg.raiden_first, agg.shreder_first, agg.ties,
+        r_one_way, s_one_way,
     );
 }
 
@@ -465,43 +579,49 @@ fn print_summary(agg: &Agg, window: Duration, total_elapsed: Duration) {
     println!("  shreder only        : {:>5}   ({:>5.1}%)", s_only,  pct(s_only, total));
     println!();
 
+    // Wall-clock race
     if agg.deltas_us.is_empty() {
-        println!("Race timing  : no shared signatures observed");
+        println!("Wall-clock race  : no shared signatures observed");
     } else {
         let mut sorted = agg.deltas_us.clone();
         sorted.sort_unstable();
-        let n = sorted.len() as i64;
-        let mean = sorted.iter().sum::<i64>() / n.max(1);
-        let p01 = percentile(&sorted, 1.0).unwrap();
-        let p05 = percentile(&sorted, 5.0).unwrap();
-        let p25 = percentile(&sorted, 25.0).unwrap();
-        let p50 = percentile(&sorted, 50.0).unwrap();
-        let p75 = percentile(&sorted, 75.0).unwrap();
-        let p95 = percentile(&sorted, 95.0).unwrap();
-        let p99 = percentile(&sorted, 99.0).unwrap();
-        let min = *sorted.first().unwrap();
-        let max = *sorted.last().unwrap();
-        let r_first = agg.raiden_first;
-        let s_first = agg.shreder_first;
-
-        println!("Race timing  (raiden_arrival − shreder_arrival)");
+        println!("Wall-clock race  (raiden_arrival − shreder_arrival)");
         println!("  Negative = shreder arrived first; positive = raiden arrived first.");
         println!("  pairs        : {:>6}", agg.deltas_us.len());
-        println!("  raiden first : {:>6}   ({:>5.1}%)", r_first, pct(r_first, both));
-        println!("  shreder first: {:>6}   ({:>5.1}%)", s_first, pct(s_first, both));
+        println!("  raiden first : {:>6}   ({:>5.1}%)", agg.raiden_first, pct(agg.raiden_first, both));
+        println!("  shreder first: {:>6}   ({:>5.1}%)", agg.shreder_first, pct(agg.shreder_first, both));
         println!("  ties         : {:>6}   ({:>5.1}%)", agg.ties, pct(agg.ties, both));
         println!();
-        println!("  delta distribution:");
-        println!("    min : {}", fmt_us(min));
-        println!("    p1  : {}", fmt_us(p01));
-        println!("    p5  : {}", fmt_us(p05));
-        println!("    p25 : {}", fmt_us(p25));
-        println!("    p50 : {}", fmt_us(p50));
-        println!("    p75 : {}", fmt_us(p75));
-        println!("    p95 : {}", fmt_us(p95));
-        println!("    p99 : {}", fmt_us(p99));
-        println!("    max : {}", fmt_us(max));
-        println!("    mean: {}", fmt_us(mean));
+        print_distribution("delta distribution:", &sorted);
+    }
+    println!();
+
+    // One-way wire latency, per provider
+    println!("One-way wire latency  (our_arrival − provider.created_at)");
+    let mut r_one = agg.raiden_one_way_us.clone();
+    r_one.sort_unstable();
+    print_distribution("raiden:", &r_one);
+    let mut s_one = agg.shreder_one_way_us.clone();
+    s_one.sort_unstable();
+    print_distribution("shreder:", &s_one);
+    println!();
+
+    // Provider-stamp race (caveat: cross-host clock skew baked in)
+    if agg.created_at_deltas_us.is_empty() {
+        println!("Provider-stamp race  : no shared sigs with both `created_at` populated");
+    } else {
+        let mut sorted = agg.created_at_deltas_us.clone();
+        sorted.sort_unstable();
+        let cab_pairs = agg.created_at_deltas_us.len() as u64;
+        println!("Provider-stamp race  (raiden.created_at − shreder.created_at)");
+        println!("  Negative = shreder stamped first; positive = raiden stamped first.");
+        println!("  Caveat: includes any clock-skew between the two provider hosts.");
+        println!("  pairs        : {:>6}", agg.created_at_deltas_us.len());
+        println!("  raiden first : {:>6}   ({:>5.1}%)", agg.created_at_raiden_first, pct(agg.created_at_raiden_first, cab_pairs));
+        println!("  shreder first: {:>6}   ({:>5.1}%)", agg.created_at_shreder_first, pct(agg.created_at_shreder_first, cab_pairs));
+        println!("  ties         : {:>6}   ({:>5.1}%)", agg.created_at_ties, pct(agg.created_at_ties, cab_pairs));
+        println!();
+        print_distribution("delta distribution:", &sorted);
     }
 
     println!();
